@@ -62,6 +62,7 @@ read the damage report at the end of the output.
 | Large recordings (repaired file over 4 GiB) | ✅ Supported | A 64-bit size field is used when needed. |
 | A frame's size field is damaged | ✅ Fixed | The correct size is calculated from the surrounding data. The frame is fully recovered. |
 | The first frame is damaged | ✅ Fixed | Found from the data in front of it, then repaired, or dropped if it can't be repaired. |
+| Recording started long after the camera was switched on (setup data laid out differently) | ✅ Supported | The setup data is found by its structure, not by fixed bytes. |
 | DJI setup data at the start of the file is damaged | ✅ Fixed | Recovered as long as the first frame is intact. |
 | A frame's header or metadata is damaged | ⚠️ Partly | Only that frame is dropped; the rest of the video is recovered. |
 | Bit errors inside the picture data | ⚠️ Partly | The frame is kept and listed in the report. It may show a glitch until the next keyframe. |

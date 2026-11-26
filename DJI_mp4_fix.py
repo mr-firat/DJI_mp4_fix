@@ -36,7 +36,11 @@ DJMD_TAG = 0x1A  # DJI per-frame record tags (single-byte protobuf keys)
 DBGI_TAG = 0x12
 PB_LEN_1, PB_VARINT_1, PB_VARINT_2, PB_VARINT_3 = 0x0A, 0x08, 0x10, 0x18
 
-DBGI_INIT_SIGNATURE = bytes.fromhex('0a 33 0a 25 0a 05 08')
+# The DBGI init block opens with field 1 { field 1 { field 1 { field 1: varint } } }.
+# Its length bytes are not fixed: they grow when a timestamp varint inside gets
+# longer (camera uptime past 2**28 us, about 4.5 minutes), so only the shape is
+# matched, never the length values.
+DBGI_INIT_NESTING = 3
 AUX_BLOCK_SIGNATURE = bytes.fromhex('44 33 22 11')
 DJI_US_PER_SECOND = 1_000_000  # DJI timestamps are in microseconds
 
@@ -411,6 +415,55 @@ def protobuf_end(mm, p, end):
     return p
 
 
+def dbgi_init_shape_at(mm, p, end):
+    """True if p starts DBGI init's nested opening: 0a L 0a L 0a L 08, lengths nested."""
+    outer_end = end
+    try:
+        for _ in range(DBGI_INIT_NESTING):
+            if mm[p] != PB_LEN_1:
+                return False
+            n, q = read_varint(mm, p + 1, outer_end)
+            if q + n > outer_end or n < 2:
+                return False
+            p, outer_end = q, q + n
+        return mm[p] == PB_VARINT_1
+    except (ValueError, IndexError):
+        return False
+
+
+def find_dbgi_init(mm, start, limit):
+    """Locate the DBGI init block that follows the DJMD init block at start.
+
+    Returns (offset, djmd_init_ok). The DJMD init holds fields 1, 2, 3 and the
+    DBGI init restarts at field 1, so walking the fields finds the boundary
+    without trusting any fixed bytes. If the DJMD init is damaged, fall back to
+    the single place in [start, limit) with DBGI init's nested opening shape.
+    """
+    p, last_field = start, 0
+    while p < limit:
+        try:
+            key, q = read_varint(mm, p, limit)
+        except ValueError:
+            break
+        field, wire = key >> 3, key & 7
+        if field <= last_field:
+            if key == PB_LEN_1 and dbgi_init_shape_at(mm, p, limit):
+                return p, True
+            break
+        if wire != 2:
+            break
+        try:
+            n, q = read_varint(mm, q, limit)
+        except ValueError:
+            break
+        last_field, p = field, q + n
+    hits = [h for h in find_all(mm, bytes([PB_LEN_1]), start + 1, limit)
+            if dbgi_init_shape_at(mm, h, limit)]
+    if len(hits) != 1:
+        raise ValueError(f'Expected one DBGI initialization block before frame 1, found {len(hits)}')
+    return hits[0], False
+
+
 def packets_ending_at(mm, lo, boundary):
     """Offsets p in [lo, boundary) whose AVCC packet ends exactly at boundary."""
     return [p for p in range(lo, boundary - NAL_LENGTH_SIZE)
@@ -486,17 +539,20 @@ def scan_source(mm, report):
     #    without trusting its length prefix; frame 1's stored length is the
     #    fallback and the cross-check.
     first_meta = metadata[frame_ids[0]][0]
-    sig = find_all(mm, DBGI_INIT_SIGNATURE, start, first_meta)
-    if len(sig) != 1 or sig[0] == start:
-        raise ValueError(f'Expected one DJMD + DBGI initialization block before frame 1, found {len(sig)}')
-    init_end = protobuf_end(mm, sig[0], first_meta)
+    dbgi_pos, djmd_init_ok = find_dbgi_init(mm, start, first_meta)
+    if dbgi_pos == start:
+        raise ValueError('DJMD initialization block is missing before the DBGI one')
+    if not djmd_init_ok:
+        report.damage.append('DJMD initialization block is not well-formed; the DBGI block '
+                             'was located by its structure')
+    init_end = protobuf_end(mm, dbgi_pos, first_meta)
     # Accept the walk if it lands on a valid NAL header, or on a length prefix
     # that ends exactly at frame 1's DJMD (frame 1's header byte may be damaged).
     walk_ok = init_end + NAL_LENGTH_SIZE < first_meta and (
         mm[init_end + NAL_LENGTH_SIZE] in NAL_HEADERS
         or (1 in metadata and init_end + NAL_LENGTH_SIZE
             + struct.unpack_from('>I', mm, init_end)[0] == metadata[1][0]))
-    candidates = packets_ending_at(mm, sig[0], metadata[1][0]) if 1 in metadata else []
+    candidates = packets_ending_at(mm, dbgi_pos, metadata[1][0]) if 1 in metadata else []
     if walk_ok:
         if len(candidates) == 1 and candidates[0] != init_end:
             raise ValueError(f'Frame 1 start is ambiguous: the init block ends at {init_end:,} but '
@@ -559,7 +615,7 @@ def scan_source(mm, report):
         report.notes.append(f'{aux:,} frame(s) carry a DJI auxiliary block (normal); it is not copied')
     report.notes.append(f'Recovered {len(frames):,} of {frame_ids[-1]:,} frames'
                         + (f'; lost: {id_ranges(missing + dropped)}' if missing or dropped else ''))
-    return Scan(frames, (start, sig[0]), (sig[0], init_end))
+    return Scan(frames, (start, dbgi_pos), (dbgi_pos, init_end))
 
 
 def write_index_csv(frames, path):
